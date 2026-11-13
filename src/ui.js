@@ -1,5 +1,5 @@
 // Home page UI, adapted from turingevo/tiny-webui (MIT), localized to Chinese.
-// Adds a secret-sn -> API key generator on top of the streaming chat client.
+// Adds a random built-in credential -> API key generator on top of the streaming chat client.
 
 export function renderHome(basePath = "") {
   const base = basePath.replace(/\/$/, ""); // e.g. "" or "/zpvoiceassistant-ai-api-proxy"
@@ -362,21 +362,10 @@ export function renderHome(basePath = "") {
     <div class="settings-section">
       <div class="settings-title">API Key 生成</div>
 
-      <div class="setting-item">
-        <label class="setting-label">secret（设备密钥）</label>
-        <input type="text" class="setting-input" id="gen-secret" placeholder="getprop ro.boot.secretkey" autocomplete="off" />
-      </div>
-
-      <div class="setting-item">
-        <label class="setting-label">sn（序列号）</label>
-        <input type="text" class="setting-input" id="gen-sn" placeholder="getprop persist.sys.serialno" autocomplete="off" />
-      </div>
-
-      <button class="mini-btn" onclick="generateApiKey()">生成并填入 API Key</button>
+      <button class="mini-btn" onclick="randomGenerateApiKey()" style="margin-top:0;">随机抽取并填入 API Key</button>
 
       <div class="hint">
-        设备上执行以下命令可直接得到两个值：<br>
-        <code>echo "API Key为: $(getprop ro.boot.secretkey)-$(getprop persist.sys.serialno)"</code>
+        自动从内置的 <span id="pair-count">0</span> 组 sn / secret 中随机抽取一组生成 API Key。
       </div>
     </div>
 
@@ -391,7 +380,7 @@ export function renderHome(basePath = "") {
 
       <div class="setting-item">
         <label class="setting-label">API Key</label>
-        <input type="password" class="setting-input" id="api-key" placeholder="secret-sn 或 base64 JSON" />
+        <input type="password" class="setting-input" id="api-key" placeholder="点击上方随机生成" />
       </div>
 
       <div class="setting-item">
@@ -599,13 +588,23 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') closeCodePreview();
 });
 
-function generateApiKey() {
-  const secret = document.getElementById('gen-secret').value.trim();
-  const sn = document.getElementById('gen-sn').value.trim();
-  if (!secret || !sn) { alert('请填写 secret 和 sn'); return; }
-  document.getElementById('api-key').value = secret + '-' + sn;
-  alert('API Key 已生成并填入左侧「API Key」输入框');
+// Built-in device credentials. Each entry is one sn + secret pair; a random
+// pair is drawn whenever the user asks for a new API Key.
+const DEVICE_CREDENTIALS = [
+  { sn: '768082512550001140', secret: 'c5797d7c1c594970a0b85e5257ed3652' },
+  { sn: '768082512550001110', secret: 'e9d7ba71fa3b47a29ff3c422311d94c3' },
+  { sn: '767082512550000280', secret: 'a1c3cd9da69e4cdf90470caee3af74d1' },
+  { sn: '767082512550001650', secret: '958835f8183f46c683902e1e0e968621' },
+  { sn: '726052405050000660', secret: '71516047ca99435a8b77fccd2060c450' }
+];
+
+function randomGenerateApiKey() {
+  const pair = DEVICE_CREDENTIALS[Math.floor(Math.random() * DEVICE_CREDENTIALS.length)];
+  document.getElementById('api-key').value = pair.secret + '-' + pair.sn;
+  alert('已随机抽取一组 sn / secret 并填入 API Key');
 }
+
+document.getElementById('pair-count').textContent = DEVICE_CREDENTIALS.length;
 
 function getSettings() {
   return {

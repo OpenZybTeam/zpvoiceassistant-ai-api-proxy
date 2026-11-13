@@ -159,11 +159,11 @@ const LOGIN_PATH = "iot-device/device/login";
 
 function loginBase(env) {
   // Derive the origin from UPSTREAM_BASE (which points at the /iot-study path).
-  const base = env.UPSTREAM_BASE || "https://iot-admin.zuoyebang.com/iot-study/assistant";
+  const base = env.UPSTREAM_BASE || "https://iot-admin-iottest-e.suanshubang.com/iot-study/assistant";
   try {
     return new URL(base).origin + "/";
   } catch {
-    return "https://iot-admin.zuoyebang.com/";
+    return "https://iot-admin-iottest-e.suanshubang.com/";
   }
 }
 
@@ -372,9 +372,13 @@ export function escapeAllToUnicode(str) {
 // Serialize one message object. Its `content` becomes a JSON string whose value
 // is the literal all-\uXXXX escape text (backslashes JSON-escaped); every other
 // field uses ordinary JSON.
+// Unicode escaping is temporarily disabled. Set to true to send message
+// content as literal \uXXXX escape text again.
+const UNICODE_ESCAPE_ENABLED = false;
+
 function serializeMessage(m) {
   const parts = Object.entries(m).map(([k, v]) => {
-    if (k === "content" && v != null) {
+    if (UNICODE_ESCAPE_ENABLED && k === "content" && v != null) {
       return `${JSON.stringify(k)}:${JSON.stringify(escapeAllToUnicode(String(v)))}`;
     }
     return `${JSON.stringify(k)}:${JSON.stringify(v)}`;

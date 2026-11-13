@@ -13,8 +13,8 @@ OpenAI 兼容 API 反向代理，运行在 Cloudflare Workers 上。
 - 流式（SSE）与非流式响应。
 - 推理模型：`deepseek-r1` 会把上游 `reasonContent` 映射为 OpenAI 的
   `reasoning_content`（流式 delta + 非流式 message 字段）。
-- 公开凭证模式：每个调用方通过 API key 自带设备凭证（`secret-sn`），worker 中不存
-  放任何设备相关参数；token 由代理自动登录获取并缓存。
+- 凭证模式：Web 主页从内置的多组设备凭证（`sn` + `secret`）中随机抽取一组生成 API
+  key，无需手动填写；worker 中不存放任何设备相关参数，token 由代理自动登录获取并缓存。
 - 以 `chatId` 为键的会话连续性；多轮对话使用确定性 chatId，新会话使用全新
   chatId。
 - 历史回填：当客户端在单次请求中携带完整消息历史时，代理会把更早的轮次逐条回放
@@ -26,7 +26,7 @@ OpenAI 兼容 API 反向代理，运行在 Cloudflare Workers 上。
   转义在签名之前完成，保证签名与请求体一致。
 - 上游错误以 OpenAI 错误格式透传。
 - 已启用 CORS，供浏览器客户端使用（反射 Origin 与请求头）。
-- 内置中文 Web 调试主页（`/`）：secret/sn 生成 API Key、拉取模型列表、白天/黑夜主题
+- 内置中文 Web 调试主页（`/`）：内置多组设备凭证中随机抽取一组生成 API Key、拉取模型列表、白天/黑夜主题
   切换、完整接口地址显示、聊天调试与实时指标。
 - Token 用量记录：按 `sn` 累计请求数、输入/输出 token（KV，30 天），可用
   `GET /v1/usage` 查询。
@@ -43,47 +43,30 @@ OpenAI 兼容 API 反向代理，运行在 Cloudflare Workers 上。
 
 ## 鉴权
 
-API key 支持两种形式：
-
-### 1. `secret-sn`（推荐，最简单）
+API key 由 Web 调试主页（`/`）自动生成：点击「随机抽取并填入 API Key」，会从项目内置的
+多组设备凭证（`sn` + `secret`）中随机抽取一组，生成并填入 API Key，无需手动填写
+`sn` / `secret`。生成结果形如：
 
 ```
-********************************-*************
+<secret>-<sn>
 ```
 
 代理会用 `sn` + `secret` 自动调用设备登录接口
 （`iot-device/device/login`）获取 token，并缓存（按 `sn` + secret 指纹，TTL 12 小时）。
 
-### 2. base64(JSON)（兼容/高级，可带额外覆盖项）
-
-```json
-{
-  "secret": "********************************",
-  "sn": "*************",
-  "token": "<jwt>"
-}
-```
-
-只有 `secret` 与 `sn` 必填；`token` 可选，省略时自动登录获取。可选覆盖字段（详见
-`src/credential.js`）：`buildNum`、`buildTime`、`versionName`、`versionCode`、
-`appName`、`romVersion`、`local`。
-
-生成 base64 key：
-
-```bash
-node -e 'console.log(Buffer.from(JSON.stringify({secret:process.argv[1],sn:process.argv[2]})).toString("base64"))' \
-  "********************************" "*************"
-```
-
 以 `Authorization: Bearer <key>` 发送（也支持 `x-api-key` / `api-key`）。
+
+> 若自行接入，API key 也兼容 base64(JSON) 形式，可携带 `token` 及 `buildNum`、
+> `buildTime`、`versionName`、`versionCode`、`appName`、`romVersion`、`local`
+> 等覆盖字段（详见 `src/credential.js`）。
 
 ## 使用
 
 ### curl
 
 ```bash
-# 设置你的 base64 API key
-KEY="<你的-base64-key>"
+# 在 Web 主页随机生成后复制过来的 API key
+KEY="<你的-api-key>"
 
 # 非流式
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -103,7 +86,7 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<你的-base64-key>")
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<你的-api-key>")
 
 resp = client.chat.completions.create(
     model="deepseek-v3",
@@ -114,7 +97,7 @@ print(resp.choices[0].message.content)
 
 ### 浏览器 / 网页前端
 
-设置 base URL（包含 `/v1`）与 base64 key。CORS 由代理处理。隧道的开发服务器示例
+设置 base URL（包含 `/v1`）与 API key。CORS 由代理处理。隧道的开发服务器示例
 base URL：
 
 ```
@@ -159,7 +142,7 @@ main = "src/index.js"
 compatibility_date = "2024-09-23"
 
 [vars]
-UPSTREAM_BASE = "https://iot-admin.zuoyebang.com/iot-study/assistant"
+UPSTREAM_BASE = "https://iot-admin-iottest-e.suanshubang.com/iot-study/assistant"
 DEFAULT_MODEL = "deepseek-v3"
 
 [[kv_namespaces]]
@@ -223,5 +206,5 @@ wrangler deploy
 ## 注意事项
 
 - WebCrypto 不支持 MD5，因此使用纯 JS 实现（`src/md5.js`）。
-- 签名 secret 是设备原生值，由调用方在凭证中提供，worker 中不存储。
+- 签名 secret 是设备原生值，内置在 Web 主页的凭证池中，worker 中不存储。
 - `error.invalid.token` 有时是上游的瞬时故障；先重试，再判断 token 是否失效。
