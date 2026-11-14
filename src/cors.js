@@ -4,7 +4,7 @@
 // wildcard when credentials are included.
 
 export const DEFAULT_ALLOW_HEADERS =
-  "Authorization,Content-Type,x-api-key,api-key,x-iot-token,x-iot-sn,x-iot-chat-id,x-iot-new-chat,x-iot-build-num,x-iot-build-time,x-iot-version-name,x-iot-version-code,x-iot-app-name,x-iot-rom-version,x-iot-local";
+  "Authorization,Content-Type,x-api-key,api-key,x-iot-token,x-iot-sn,x-iot-chat-id,x-iot-new-chat,x-iot-persona,x-iot-stacks,x-iot-build-num,x-iot-build-time,x-iot-version-name,x-iot-version-code,x-iot-app-name,x-iot-rom-version,x-iot-local";
 
 export const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",

@@ -14,6 +14,9 @@ import { sendChatTurn } from "./upstream.js";
 
 const PREFIX = "hist:";
 const TOKEN_PREFIX = "tok:";
+// Device login tokens are long-lived JWTs; caching them for months avoids a
+// login round-trip (and a rate-limit hit) on every cold request.
+const TOKEN_CACHE_TTL = 60 * 60 * 24 * 90;
 
 function key(sn, chatId) {
   return `${PREFIX}${sn}:${chatId}`;
@@ -27,8 +30,23 @@ export async function getCachedToken(env, sn, secret) {
   if (!env.HISTORY || !sn) return "";
   try {
     return (await env.HISTORY.get(`${TOKEN_PREFIX}${sn}:${secretKey(secret)}`)) || "";
-  } catch {
+  } catch (err) {
+    console.error("[getCachedToken] " + (err && err.message ? err.message : err));
     return "";
+  }
+}
+
+// 读取 JWT 的 exp（秒）并换算成剩余秒数；解析不了就退回默认 TTL。
+function tokenTtlSeconds(token) {
+  try {
+    const parts = String(token).split(".");
+    if (parts.length < 2) return TOKEN_CACHE_TTL;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (!payload || typeof payload.exp !== "number") return TOKEN_CACHE_TTL;
+    const left = payload.exp - Math.floor(Date.now() / 1000) - 300; // 提前 5 分钟
+    return left > 60 ? Math.min(left, TOKEN_CACHE_TTL) : 60;
+  } catch {
+    return TOKEN_CACHE_TTL;
   }
 }
 
@@ -36,10 +54,10 @@ export async function setCachedToken(env, sn, secret, token) {
   if (!env.HISTORY || !sn || !token) return;
   try {
     await env.HISTORY.put(`${TOKEN_PREFIX}${sn}:${secretKey(secret)}`, token, {
-      expirationTtl: 60 * 60 * 12,
+      expirationTtl: tokenTtlSeconds(token),
     });
-  } catch {
-    // best-effort
+  } catch (err) {
+    console.error("[setCachedToken] " + (err && err.message ? err.message : err));
   }
 }
 

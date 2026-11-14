@@ -12,8 +12,21 @@ UPSTREAM_BASE = "https://iot-admin-iottest-e.suanshubang.com/iot-study/assistant
 # Default model when the request omits one.
 DEFAULT_MODEL = "deepseek-v3"
 
-# KV namespace used to remember how much conversation history has been replayed
-# into an upstream thread (backfill). Optional: without it, backfill is skipped.
+# Persona preset injected into every request (see src/persona.js).
+# plain / neutral / engineer / api / redteam / reference / unlock / malware / off
+DEFAULT_PERSONA = "unlock"
+
+# Per-model persona overrides, "model=preset,model=preset". Built-in table:
+#   deepseek-v3 -> unlock, deepseek-r1 -> r1, baike -> baike
+# Anything listed here wins over the built-in table.
+# MODEL_PERSONA = "baike=reference,deepseek-r1=unlock"
+
+# Single storage namespace. Holds everything that used to be hard-coded:
+#   cfg:admin      admin password hash
+#   tok:*          API tokens (sk-...), quota and expiry
+#   sn:*           sn/secret pool
+#   mem:*          per-chatId transcript (survives device rotation)
+#   usage:*        per-token / per-device counters
 # Create with: wrangler kv namespace create HISTORY
 [[kv_namespaces]]
 binding = "HISTORY"

@@ -210,7 +210,25 @@ export async function login(env, cred) {
     const msg = (json && (json.errMsg || json.message)) || "no token in login response";
     throw new Error(`login failed: ${msg}`);
   }
+  login.lastInfo = {
+    binded: Number(json.data.binded) || 0,
+    catbinded: Number(json.data.catbinded) || 0,
+    halted: Number(json.data.halted) || 0,
+    deviceId: json.data.device_id || 0,
+    errNo: json.errno ?? json.errNo ?? 0,
+  };
   return token;
+}
+
+// 只取 token 的登录（内部使用），不关心绑定状态
+export async function loginToken(env, cred) {
+  return login(env, cred);
+}
+
+// 登录并返回 { token, binded, catbinded, halted, deviceId }
+export async function loginDetailed(env, cred) {
+  const token = await login(env, cred);
+  return { token, ...(login.lastInfo || { binded: 0, catbinded: 0, halted: 0, deviceId: 0, errNo: 0 }) };
 }
 
 // Build the signed query string for a request. `commonParams` is the output of
@@ -423,23 +441,54 @@ export async function sendChatTurn(env, commonParams, secret, { chatId, content,
 //   data: {"action":"","chatId":"...",...}
 //
 //   event: error / event: notAllow
+// 单个 SSE 事件的理论上限；超出说明上游发了一坨异常数据，直接丢弃防止内存膨胀。
+const MAX_EVENT_BYTES = 1024 * 1024;
+const MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+// 上游回 200 之后 body 仍可能长时间不动（限流时会挂了不吐字）。
+// 每次 read 都加一个保活超时，卡住就抛错，让调用方拿到明确失败而不是干等。
+const STALL_TIMEOUT_MS = 30000;
+
 export async function* parseUpstreamSSE(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let dropped = 0;
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          const e = new Error(`upstream stream stalled for ${STALL_TIMEOUT_MS}ms`);
+          e.code = "stall_timeout";
+          reject(e);
+        }, STALL_TIMEOUT_MS)
+      ),
+    ]);
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+
+    if (buffer.length > MAX_BUFFER_BYTES) {
+      // 没有事件分隔符的巨型数据块：保留尾部，丢掉前面的垃圾
+      buffer = buffer.slice(-MAX_EVENT_BYTES);
+      dropped++;
+    }
 
     let idx;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const rawEvent = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
+      if (rawEvent.length > MAX_EVENT_BYTES) {
+        dropped++;
+        continue;
+      }
       const parsed = parseEventBlock(rawEvent);
       if (parsed) yield parsed;
     }
+  }
+  if (dropped > 0) {
+    console.error("[sse] dropped " + dropped + " oversized event(s)");
   }
   const parsed = parseEventBlock(buffer);
   if (parsed) yield parsed;

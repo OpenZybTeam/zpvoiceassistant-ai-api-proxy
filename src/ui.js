@@ -1,7 +1,7 @@
 // Home page UI, adapted from turingevo/tiny-webui (MIT), localized to Chinese.
 // Adds a random built-in credential -> API key generator on top of the streaming chat client.
 
-export function renderHome(basePath = "") {
+export function renderHome(basePath = "", poolSize = 0) {
   const base = basePath.replace(/\/$/, ""); // e.g. "" or "/zpvoiceassistant-ai-api-proxy"
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -323,16 +323,50 @@ export function renderHome(basePath = "") {
   .send-btn:active { transform: scale(0.95); }
   .send-btn:disabled { background: var(--text-dim); cursor: not-allowed; transform: none; box-shadow: none; }
   .send-btn svg { width: 20px; height: 20px; fill: var(--bg-deep); }
-  @media (max-width: 768px) {
-    .sidebar { display: none; }
-    .messages-container { padding: 16px; }
-    .input-container { padding: 12px 16px; }
+  /* ---- 移动端：侧边栏变抽屉 ---- */
+  .menu-btn {
+    display: none; width: 36px; height: 36px; border-radius: 8px; flex-shrink: 0;
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+    align-items: center; justify-content: center; cursor: pointer; font-size: 16px;
+  }
+  .menu-btn:hover { border-color: var(--amber); color: var(--amber); }
+  .sidebar-backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    z-index: 90; backdrop-filter: blur(2px);
+  }
+  .sidebar-backdrop.open { display: block; }
+  @media (max-width: 900px) {
+    .header { padding: 0 12px; gap: 8px; height: 56px; }
+    .logo { font-size: 15px; letter-spacing: 1px; }
+    .logo-icon { width: 24px; height: 24px; font-size: 12px; }
+    .web span { display: none; }
+    .header-stats { gap: 12px; }
+    .stat-label { font-size: 8px; }
+    .stat-value { font-size: 13px; }
+    .menu-btn { display: flex; }
+
+    .sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; width: min(86vw, 320px);
+      min-width: 0; z-index: 100; transform: translateX(-100%);
+      transition: transform .22s ease; box-shadow: 4px 0 24px rgba(0,0,0,.4);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .messages-container { padding: 14px; }
+    .input-container { padding: 10px 12px 16px; }
+    .input-row { gap: 8px; }
+    .send-btn { width: 46px; height: 46px; }
+    textarea#msg-input { font-size: 15px; min-height: 46px; }
+  }
+  @media (max-width: 480px) {
+    .header-stats .stat-item:nth-child(3) { display: none; }
+    .logo { font-size: 13px; }
   }
 </style>
 </head>
 <body>
 
 <header class="header">
+  <button class="menu-btn" id="menu-btn" aria-label="打开设置">☰</button>
   <div class="logo">
     <div class="logo-icon">⬡</div>
     iot-study AI 代理
@@ -357,16 +391,13 @@ export function renderHome(basePath = "") {
   </div>
 </header>
 
+<div class="sidebar-backdrop" id="sidebar-backdrop"></div>
 <div class="main-container">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="settings-section">
-      <div class="settings-title">API Key 生成</div>
+      <div class="settings-title">凭证</div>
 
-      <button class="mini-btn" onclick="randomGenerateApiKey()" style="margin-top:0;">随机抽取并填入 API Key</button>
-
-      <div class="hint">
-        自动从内置的 <span id="pair-count">0</span> 组 sn / secret 中随机抽取一组生成 API Key。
-      </div>
+      <div class="hint" style="margin-top:0;">上游单条消息按字节计上限约 1000 字节（中文约 333 字），超长内容由代理自动切片续写。</div>
     </div>
 
     <div class="settings-section">
@@ -380,7 +411,8 @@ export function renderHome(basePath = "") {
 
       <div class="setting-item">
         <label class="setting-label">API Key</label>
-        <input type="password" class="setting-input" id="api-key" placeholder="点击上方随机生成" />
+        <input type="password" class="setting-input" id="api-key" placeholder="sk-..." />
+        <div class="hint">没有密钥请联系管理员获取</div>
       </div>
 
       <div class="setting-item">
@@ -491,9 +523,28 @@ let sessionTokens = 0;
 // mounted under a sub-path). Injected by the server.
 var API_BASE = ${JSON.stringify(base)};
 
+// ---- Mobile drawer ----
+(function initDrawer() {
+  var btn = document.getElementById('menu-btn');
+  var bar = document.getElementById('sidebar');
+  var backdrop = document.getElementById('sidebar-backdrop');
+  if (!btn || !bar || !backdrop) return;
+  var close = function () {
+    bar.classList.remove('open');
+    backdrop.classList.remove('open');
+  };
+  btn.addEventListener('click', function () {
+    var open = !bar.classList.contains('open');
+    bar.classList.toggle('open', open);
+    backdrop.classList.toggle('open', open);
+  });
+  backdrop.addEventListener('click', close);
+  window.addEventListener('resize', function () { if (window.innerWidth > 900) close(); });
+})();
+
 // ---- Theme ----
 (function initTheme() {
-  var saved = localStorage.getItem('iot-theme') || 'dark';
+  var saved = localStorage.getItem('iot-theme') || 'light';
   document.documentElement.setAttribute('data-theme', saved);
 })();
 
@@ -551,11 +602,9 @@ document.getElementById('model-select').addEventListener('change', function() {
 // ---- Cumulative usage from /v1/usage ----
 async function refreshUsage() {
   var info = document.getElementById('usage-info');
-  var key = document.getElementById('api-key').value.trim();
-  if (!key) { info.textContent = '请先填写 API Key'; return; }
   info.textContent = '查询中……';
   try {
-    var res = await fetch(API_BASE + '/v1/usage', { headers: { 'Authorization': 'Bearer ' + key } });
+    var res = await fetch(API_BASE + '/v1/usage', { headers: { 'Authorization': 'Bearer ' + PLACEHOLDER_API_KEY } });
     var data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
     info.textContent = '请求 ' + data.requests + ' 次 · 输入 ' + data.prompt_tokens +
@@ -588,28 +637,25 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') closeCodePreview();
 });
 
-// Built-in device credentials. Each entry is one sn + secret pair; a random
-// pair is drawn whenever the user asks for a new API Key.
-const DEVICE_CREDENTIALS = [
-  { sn: '768082512550001140', secret: 'c5797d7c1c594970a0b85e5257ed3652' },
-  { sn: '768082512550001110', secret: 'e9d7ba71fa3b47a29ff3c422311d94c3' },
-  { sn: '767082512550000280', secret: 'a1c3cd9da69e4cdf90470caee3af74d1' },
-  { sn: '767082512550001650', secret: '958835f8183f46c683902e1e0e968621' },
-  { sn: '726052405050000660', secret: '71516047ca99435a8b77fccd2060c450' }
-];
+// The device credential pool lives in the worker (src/credential.js) and is drawn
+// A real sk- token is required (ask the administrator).
+let PLACEHOLDER_API_KEY = localStorage.getItem('iot-api-key') || '';
 
-function randomGenerateApiKey() {
-  const pair = DEVICE_CREDENTIALS[Math.floor(Math.random() * DEVICE_CREDENTIALS.length)];
-  document.getElementById('api-key').value = pair.secret + '-' + pair.sn;
-  alert('已随机抽取一组 sn / secret 并填入 API Key');
-}
-
-document.getElementById('pair-count').textContent = DEVICE_CREDENTIALS.length;
+document.addEventListener('DOMContentLoaded', function () {
+  var el = document.getElementById('api-key');
+  if (el) {
+    el.value = PLACEHOLDER_API_KEY;
+    el.addEventListener('input', function () {
+      PLACEHOLDER_API_KEY = this.value.trim();
+      localStorage.setItem('iot-api-key', PLACEHOLDER_API_KEY);
+    });
+  }
+});
 
 function getSettings() {
   return {
     endpoint: document.getElementById('endpoint').value.trim() || '/v1/chat/completions',
-    apiKey: document.getElementById('api-key').value.trim() || 'empty',
+    apiKey: (document.getElementById('api-key') && document.getElementById('api-key').value.trim()) || PLACEHOLDER_API_KEY,
     model: document.getElementById('model').value.trim() || 'deepseek-v3',
     maxTokens: parseInt(document.getElementById('max-tokens').value) || 4096,
     temperature: parseFloat(document.getElementById('temperature').value) || 0.7,
@@ -878,7 +924,7 @@ async function sendMessage() {
       messages: messages,
       max_tokens: settings.maxTokens,
       temperature: settings.temperature,
-      stream: true
+      stream: true // 始终流式，首字先到
     };
 
     const headers = {
@@ -930,15 +976,19 @@ async function sendMessage() {
           const delta = choice.content || '';
           const reasoningDelta = choice.reasoning_content || '';
           if (!delta && !reasoningDelta) continue;
-          if (firstTokenTime === null) firstTokenTime = performance.now() - startTime;
+          var isFirstToken = firstTokenTime === null;
+          if (isFirstToken) firstTokenTime = performance.now() - startTime;
           totalTokens++;
           if (reasoningDelta) reasoningAccum += reasoningDelta;
           if (delta) cachedCompletion += delta;
-          if (!renderTimer) {
+          if (isFirstToken) {
+            // 首个 token 立即上屏，不等节流
+            updateAssistantMessage(contentEl, reasoningAccum, cachedCompletion, true);
+          } else if (!renderTimer) {
             renderTimer = setTimeout(() => {
               renderTimer = null;
               updateAssistantMessage(contentEl, reasoningAccum, cachedCompletion, true);
-            }, 30);
+            }, 16);
           }
           const now = performance.now();
           const elapsed = (now - startTime) / 1000;
