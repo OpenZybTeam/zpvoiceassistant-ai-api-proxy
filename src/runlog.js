@@ -13,8 +13,10 @@
 
 import { getJSON, hasKV, putJSON } from "./store.js";
 
-const RECENT_KEY = "log:recent";
-const RECENT_MAX = 100;
+// 每条日志独立存一个 key：log:<ts>:<id>。
+// 早期用单个数组 log:recent，并发请求会读改写互相覆盖导致日志丢失。
+const LOG_PREFIX = "log:";
+const RECENT_MAX = 200;
 const RECENT_TTL = 60 * 60 * 24 * 7;
 
 // 一次请求的最大允许耗时。超过就主动中断并返回明确错误，
@@ -98,22 +100,64 @@ export async function commitRun(env, record) {
 
   if (!hasKV(env)) return record;
   try {
-    const recent = (await getJSON(env, RECENT_KEY, [])) || [];
-    recent.unshift(record);
-    await putJSON(env, RECENT_KEY, recent.slice(0, RECENT_MAX), RECENT_TTL);
+    // 时间戳放在 key 里，按字典序倒排即为时间倒序
+    const key = `${LOG_PREFIX}${String(record.startedAt).padStart(15, "0")}:${record.id}`;
+    await putJSON(env, key, record, RECENT_TTL);
+    // 顺手清理超出上限的旧日志（异步，失败不影响主流程）
+    pruneOld(env).catch(() => {});
   } catch (err) {
     console.error("[log] persist failed: " + (err && err.message ? err.message : err));
   }
   return record;
 }
 
+// 保留最近 RECENT_MAX 条，删除更早的
+async function pruneOld(env) {
+  if (!hasKV(env)) return 0;
+  const store = env.HISTORY;
+  try {
+    const listed = await store.list({ prefix: LOG_PREFIX, limit: 1000 });
+    const keys = listed.keys.map((k) => k.name).sort();
+    if (keys.length <= RECENT_MAX) return 0;
+    const drop = keys.slice(0, keys.length - RECENT_MAX);
+    for (const k of drop) {
+      try { await store.delete(k); } catch {}
+    }
+    return drop.length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function listRecentLogs(env, limit = 50) {
-  const recent = (await getJSON(env, RECENT_KEY, [])) || [];
-  return recent.slice(0, Math.max(1, Math.min(limit, RECENT_MAX)));
+  if (!hasKV(env)) return [];
+  const n = Math.max(1, Math.min(limit, RECENT_MAX));
+  try {
+    const listed = await env.HISTORY.list({ prefix: LOG_PREFIX, limit: 1000 });
+    const keys = listed.keys.map((k) => k.name).sort().reverse().slice(0, n);
+    const out = [];
+    for (const k of keys) {
+      const rec = await getJSON(env, k, null);
+      if (rec) out.push(rec);
+    }
+    return out;
+  } catch (err) {
+    console.error("[log] list failed: " + (err && err.message ? err.message : err));
+    return [];
+  }
 }
 
 export async function clearRecentLogs(env) {
-  await putJSON(env, RECENT_KEY, [], RECENT_TTL);
+  if (!hasKV(env)) return 0;
+  try {
+    const listed = await env.HISTORY.list({ prefix: LOG_PREFIX, limit: 1000 });
+    for (const k of listed.keys) {
+      try { await env.HISTORY.delete(k.name); } catch {}
+    }
+    return listed.keys.length;
+  } catch {
+    return 0;
+  }
 }
 
 // 给任意 Promise 加超时，超时后 reject 一个带 code 的 Error。

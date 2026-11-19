@@ -448,6 +448,48 @@ print(resp.choices[0].finish_reason, resp.choices[0].message.tool_calls)
 > 这是**模拟**：是否真的发起调用取决于模型是否遵守格式。实测在明确任务下能稳定调用
 > （`finish_reason=tool_calls`），但任务描述模糊时它仍可能直接编造结果而不调用工具。
 
+## 错误码与重试
+
+### 上游失败形态
+
+| 上游返回 | 代理识别为 | 含义 |
+| --- | --- | --- |
+| `{"code":4001,"message":"今日次数已用完"}` | `quota_exhausted` | 当日配额用尽 |
+| `{"code":200,"message":"success","data":null}` | `upstream_opaque_success` | 限流/卡死的伪装成功 |
+| 无正文无错误 | `upstream_empty` | 空响应 |
+| 池内无可用设备 | `pool_empty` | 全部禁用/失效/未绑定 |
+
+### 统一返回 429
+
+以上都属于「暂时不可用」，代理统一返回 **HTTP 429** 并带可重试标记：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+
+{
+  "error": {
+    "message": "All pool devices returned an opaque upstream failure. Last upstream reply: opaque success payload on 001490",
+    "type": "rate_limit_error",
+    "code": "upstream_opaque_success",
+    "retryable": true,
+    "retry_after": 30
+  }
+}
+```
+
+| code | Retry-After | 说明 |
+| --- | --- | --- |
+| `upstream_opaque_success` | 30 | 限流，短退避后重试 |
+| `upstream_empty` | 30 | 空响应 |
+| `quota_exhausted` | 3600 | 当日配额用完，次日恢复 |
+| `pool_empty` | 60 | 池内无可用设备 |
+
+**为什么用 429 而不是 502**：主流 agent 平台和 OpenAI SDK 都把 429 当作可重试状态，
+会自动退避；502 往往被当作硬失败直接抛给用户。
+
+另外 `message` 里会带 `Last upstream reply`，能看到最后是哪台设备、什么原因失败。
+
 ## 请求日志
 
 每个 `/v1/chat/completions` 请求都会生成一条 run log：
@@ -462,6 +504,45 @@ print(resp.choices[0].finish_reason, resp.choices[0].message.tool_calls)
 ```
 req_sbj892xl6pft ok 8629ms | auth:53 → body:0 → bind:16 → pick:6 → upstream:8539
 ```
+
+### 后台任务的 ctx.waitUntil
+
+响应返回后，Workers 会立即终止 isolate，**fire-and-forget 的 KV 写会被砍掉**。
+日志持久化、令牌用量、设备成功计数都属于这类后台任务，必须挂到 `ctx.waitUntil()`：
+
+```js
+async fetch(request, env, ctx) { ... }
+
+function background(ctx, promise, label) {
+  const p = Promise.resolve(promise).catch((e) => console.error(`[${label}] ${e.message}`));
+  if (ctx?.waitUntil) ctx.waitUntil(p);
+  return p;
+}
+```
+
+> 早期版本用 `await commitRun()` 会阻塞流式响应（背压卡死 → 0 字节），改成 fire-and-forget
+> 后又因为 isolate 被终止导致**日志全部丢失**。`ctx.waitUntil()` 是两者兼顾的做法。
+
+### 长文本切片的并发策略
+
+上游单条消息只有 ~1000 字节，超长内容会被切成多片。切片策略经过多轮实测：
+
+| 策略 | 30000 字耗时 | 重试次数 | 结论 |
+| --- | --- | --- | --- |
+| 串行逐片 | 150s+ | - | 太慢 |
+| **并发 3，不分散设备** | **41-44s** | 88 | ✅ **最优** |
+| 并发 3，分散到不同设备 | 45s | 132 | ❌ 更差 |
+| 并发 2 | 56s | - | ❌ 更差 |
+
+**关键发现**：上游限流按**账号池整体**计，与设备数量无关。并发分散到多台设备只会更快打满配额，
+所以切片统一用当前设备，失败后才由 `sendTurnWithDeviceRetry` 换设备。
+
+其他要点：
+
+- **中间片只负责"喂内容"**，不要让模型展开回答；但也不要让它"只回收到"——
+  实测上游对这类指令更容易返回伪成功包；
+- **单片失败不中断整条链**，跳过继续；全部失败时用最后一条有效回答兜底；
+- **整体受 `deadlineMs` 约束**，接近截止时间就停止切片，用已有内容作答。
 
 ### 流式响应注意事项
 

@@ -43,7 +43,9 @@ const FIRST_TURN_SYSTEM_PROMPT = "";
 const CHUNKED_INPUT = true;
 
 // Retries for opaque transient upstream failures ("success" payloads).
-const UPSTREAM_RETRIES = 4;
+// 内层只在同一台设备上做极少量重试；限流是设备级状态，多等没意义，
+// 交给外层换设备更快。4 次 x 22.5s 退避曾把请求拖到 120 秒。
+const UPSTREAM_RETRIES = 2;
 
 // Account one completed request against both the device (sn) and the API token.
 async function recordUsage(meta, promptTokens, completionTokens) {
@@ -64,6 +66,29 @@ function err(message, type, code, status, cors = CORS_HEADERS) {
     JSON.stringify({ error: { message, type, param: null, code } }),
     { status, headers: { "Content-Type": "application/json; charset=utf-8", ...cors } }
   );
+}
+
+// 429 + Retry-After：告诉平台"稍后重试"，而不是"你请求错了"。
+function retryableErr(message, code, retryAfterSec = 30, cors = CORS_HEADERS, extra = {}) {
+  const body = JSON.stringify({
+    error: {
+      message,
+      type: "rate_limit_error",
+      param: null,
+      code,
+      retryable: true,
+      retry_after: retryAfterSec,
+      ...extra,
+    },
+  });
+  return new Response(body, {
+    status: 429,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Retry-After": String(retryAfterSec),
+      ...cors,
+    },
+  });
 }
 
 // Convert an upstream error payload into an OpenAI-style error response.
@@ -268,7 +293,7 @@ export async function handleChatCompletions(request, env, cred, credentialSource
   const toolsOn = hasTools(body);
   const messages = toolsOn ? renderToolResults(body.messages) : body.messages;
   // agent 负责注入工具定义；代理只补一句格式对齐，把调用块收敛成可解析的样子
-  const toolPrompt = toolsOn ? buildAdapterHint(body.tool_choice) : "";
+  const toolPrompt = toolsOn ? buildAdapterHint(body.tool_choice, body.tools) : "";
 
   const content = lastUserContent(messages);
   if (!content) {
@@ -291,7 +316,7 @@ export async function handleChatCompletions(request, env, cred, credentialSource
 
   // Persona directive prepended to the live turn (see src/persona.js).
   // Per-model override table (src/persona.js MODEL_PERSONAS) decides the default.
-  const persona = resolvePersona(request, body, env, requestedModel);
+  let persona = resolvePersona(request, body, env, requestedModel);
 
   // Resolve the auth token. The API key may carry one directly; otherwise we log
   // in with the client's sn + secret (cached per sn in KV) to obtain one.
@@ -454,7 +479,9 @@ export async function handleChatCompletions(request, env, cred, credentialSource
     messages.map((m) => contentToString(m.content)).join("\n")
   );
   if (toolsOn && toolPrompt) {
-    liveContent = `${toolPrompt}\n\n${liveContent}`;
+    // 工具清单跟随人设一起作为前置设定轮发送，不参与切片，
+    // 否则切散后最后一片看不到"有哪些工具"，模型只会编造结果。
+    persona = { ...(persona || { name: "off", text: "" }), text: persona && persona.text ? `${persona.text}\n${toolPrompt}` : toolPrompt };
   }
 
   const meta = {
@@ -523,6 +550,8 @@ export async function handleChatCompletions(request, env, cred, credentialSource
         meta,
         cors,
         persona: fitPersonaForChunk(persona),
+        requestedCtx: ctx,
+        onStreamDone: ctx.onStreamDone || null,
       });
     }
 
@@ -534,6 +563,10 @@ export async function handleChatCompletions(request, env, cred, credentialSource
         model,
         kind,
         persona: fitPersonaForChunk(persona),
+        pickDevice: ctx.pickDevice || null,
+        deadlineMs: ctx.deadlineMs || 0,
+        startedAt: ctx.startedAt || Date.now(),
+        onEvent: ctx.onChunkEvent || null,
       });
     } catch (e) {
       return err(`Upstream: ${e.message}`, "api_error", e.upstream?.errno || "upstream_error", 502, cors);
@@ -584,7 +617,8 @@ export async function handleChatCompletions(request, env, cred, credentialSource
     lastFailure = await upstream.text().catch(() => "");
     const opaque = /"message"\s*:\s*"success"/.test(lastFailure) || /^success$/.test(lastFailure.trim());
     if (!opaque || attempt === UPSTREAM_RETRIES) break;
-    await new Promise((r) => setTimeout(r, 1500 * 2 ** attempt));
+    // 限流类失败不原地长等：1s、2s 足够，失败就交给外层换设备
+    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
   }
 
   if (!upstream || !upstream.ok) {
@@ -601,6 +635,50 @@ export async function handleChatCompletions(request, env, cred, credentialSource
     return aggregate(upstream, meta, cors);
   }
 
+  // 流式：先探测首事件。伪成功/限流会在首事件就是 error，
+  // 此时还没写任何内容帧，可以安全地让上层换设备重试。
+  let probe = null;
+  try {
+    probe = await probeFirstEvent(upstream);
+  } catch (err) {
+    probe = { ok: true, first: null, rest: null };
+  }
+  if (probe && probe.ok === false) {
+    const payload = probe.payload || {};
+    const opaque = isOpaqueSuccess(payload) || !payload.message;
+    return retryableErr(
+      `Upstream returned an empty success payload on first event (${opaque ? "opaque/rate-limited" : (payload.message || "error")}). Retrying with another device is allowed.`,
+      opaque ? "upstream_opaque_success" : "upstream_error",
+      30,
+      cors,
+      { device_retryable: true }
+    );
+  }
+
+  // 正常：把首事件之后的数据接上，继续走原来的流式转换
+  if (probe && probe.rest) {
+    const merged = new ReadableStream({
+      start(controller) {},
+      async pull(controller) {
+        const reader = probe.rest.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { controller.close(); return; }
+            controller.enqueue(value);
+          }
+        } catch (e) {
+          controller.error(e);
+        }
+      },
+    });
+    // 首事件本身也要保留（可能是 done 或 message）
+    upstream = new Response(merged, { headers: upstream.headers });
+    meta.__firstEvent = probe.first;
+  }
+
+  // 流式普通路径也支持"流结束才提交日志"
+  meta.onStreamDone = ctx.onStreamDone || null;
   return streamResponse(upstream, meta, cors);
 }
 
@@ -633,11 +711,10 @@ async function aggregate(upstream, meta, cors) {
   }
   if (upstreamError && !text) {
     if (isOpaqueSuccess(upstreamError) || !upstreamError.message) {
-      return err(
+      return retryableErr(
         "Upstream returned an empty success payload (opaque failure / rate limit). Retry later or use another device.",
-        "api_error",
         "upstream_opaque_success",
-        502,
+        30,
         cors
       );
     }
@@ -645,11 +722,10 @@ async function aggregate(upstream, meta, cors) {
   }
   // 兜底：没有任何正文也没有明确错误 —— 同样是伪成功
   if (!text && !reason) {
-    return err(
+    return retryableErr(
       "Upstream returned no content (possibly rate limited). Retry later.",
-      "api_error",
       "upstream_empty",
-      502,
+      30,
       cors
     );
   }
@@ -727,6 +803,102 @@ function completionPayload(text, reason, meta, cors, extraHeaders = null) {
 }
 
 // Streaming: translate upstream SSE events to OpenAI chat.completion.chunk frames.
+// 首事件探测：读取上游第一个 SSE 事件。若为 error，说明是伪成功/限流，
+// 此时尚未向客户端写任何内容，可以安全地换设备重试。
+// 返回 { ok:true, first, rest } 或 { ok:false, payload }
+export async function probeFirstEvent(upstream) {
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  const chunks = [];
+
+  // 读到第一个完整事件为止
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      const tail = buffer;
+      return { ok: true, first: parseEventBlockSafe(tail), rest: makeRestStream(chunks, null, tail) };
+    }
+    chunks.push(value);
+    buffer += decoder.decode(value, { stream: true });
+    const idx = buffer.indexOf("\n\n");
+    if (idx !== -1) {
+      const raw = buffer.slice(0, idx);
+      const first = parseEventBlockSafe(raw);
+      const remaining = buffer.slice(idx + 2);
+      if (first && first.event === "error") {
+        // 把剩余部分读完，拿到完整错误信息（通常是那段 {"message":"success"}）
+        let more = "";
+        try {
+          while (true) {
+            const r = await reader.read();
+            if (r.done) break;
+            more += decoder.decode(r.value, { stream: true });
+            if (more.length > 2048) break; // 够判断了
+          }
+        } catch {
+          // 读不完也没关系
+        }
+        try { reader.cancel(); } catch {}
+        return { ok: false, payload: first.data, extra: more.slice(0, 500) };
+      }
+      return { ok: true, first, rest: makeRestStream(chunks, reader, remaining) };
+    }
+  }
+}
+
+function parseEventBlockSafe(block) {
+  if (!block || !block.trim()) return null;
+  let event = "";
+  const dataLines = [];
+  for (const line of String(block).split(/\r?\n/)) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  const dataStr = dataLines.join("\n");
+  let data = null;
+  if (dataStr) {
+    try {
+      data = JSON.parse(dataStr);
+    } catch {
+      data = { raw: dataStr };
+    }
+  }
+  return { event, data };
+}
+
+// 把"已读的第一个事件之后的数据"重新拼成一个可迭代的流
+function makeRestStream(chunks, reader, tail) {
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      const head = enc.encode(tail);
+      if (head.length) controller.enqueue(head);
+    },
+    async pull(controller) {
+      if (!reader) {
+        controller.close();
+        return;
+      }
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      try { reader && reader.cancel(reason); } catch {}
+    },
+  });
+}
+
 function streamResponse(upstream, meta, cors) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
@@ -867,6 +1039,13 @@ function streamResponse(upstream, meta, cors) {
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } finally {
       await writer.close();
+      // 流已关闭：此时 await 日志提交不会阻塞任何客户端数据，
+      // 但能让 isolate 存活到 KV 写完（fire-and-forget 会被静默丢弃）。
+      try {
+        if (typeof meta.onStreamDone === "function") await meta.onStreamDone();
+      } catch (err) {
+        console.error("[stream] onStreamDone failed: " + (err && err.message ? err.message : err));
+      }
     }
   })();
 
@@ -884,7 +1063,7 @@ function streamResponse(upstream, meta, cors) {
 // Streaming wrapper for the chunked path: run every chunk upstream, then emit the
 // final answer as ordinary chat.completion.chunk frames. Progress of the staging
 // turns is surfaced as SSE comments so clients can show what is happening.
-function streamLongMessage(request, env, commonParams, secret, { chatId, content, model, kind, meta, cors, persona }) {
+function streamLongMessage(request, env, commonParams, secret, { chatId, content, model, kind, meta, cors, persona, requestedCtx = {}, onStreamDone = null }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -910,9 +1089,19 @@ function streamLongMessage(request, env, commonParams, secret, { chatId, content
         model,
         kind,
         persona,
+        pickDevice: requestedCtx.pickDevice || null,
+        deadlineMs: requestedCtx.deadlineMs || 0,
+        startedAt: requestedCtx.startedAt || Date.now(),
         onEvent: (type, payload) => {
+          // 进度帧给客户端看
           if (type === "chunk") {
             write(`: x-iot-progress ${payload.index + 1}/${payload.total}\n\n`).catch(() => {});
+          }
+          // 同时转给路由层写日志：chunk-ms / batch-ms / retry / chunk-failed 都要能看见
+          try {
+            if (typeof requestedCtx.onChunkEvent === "function") requestedCtx.onChunkEvent(type, payload);
+          } catch {
+            // 日志失败不影响主流程
           }
         },
       });
@@ -955,6 +1144,12 @@ function streamLongMessage(request, env, commonParams, secret, { chatId, content
         await writer.close();
       } catch {
         // already closed
+      }
+      // 流真正结束后再提交日志快照，这样切片过程中的打点才进得去
+      try {
+        if (typeof onStreamDone === "function") await onStreamDone();
+      } catch (err) {
+        console.error("[stream] onStreamDone failed: " + (err && err.message ? err.message : err));
       }
     }
   })();

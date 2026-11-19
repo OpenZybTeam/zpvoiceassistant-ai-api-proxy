@@ -543,12 +543,35 @@ async function checkSn(sn) {
   catch (e) { setMsg('sn-msg', '检测失败：' + e.message, false); }
 }
 
+// 分批检测：每批 15 台，带进度，直到 done
+let checking = false;
 async function checkAllSn() {
-  setMsg('sn-msg', '检测中…', true);
-  try { const d = await api('/api/sns/check', { method: 'POST', body: JSON.stringify({ all: true }) });
-    const ok = d.results.filter(r => r.ok).length;
-    setMsg('sn-msg', '检测完成：' + ok + '/' + d.results.length + ' 可用', true); loadAll();
-  } catch (e) { setMsg('sn-msg', '检测失败：' + e.message, false); }
+  if (checking) return setMsg('sn-msg', '正在检测中，请稍候…', false);
+  checking = true;
+  const agg = { checked: 0, ok: 0, quota: 0, limited: 0, unbound: 0, failed: 0 };
+  let cursor = 0;
+  let total = 0;
+  try {
+    while (true) {
+      const d = await api('/api/sns/check', { method: 'POST', body: JSON.stringify({ all: true, limit: 15, cursor }) });
+      total = d.total || total;
+      for (const k of Object.keys(agg)) agg[k] += (d.summary?.[k] || 0);
+      const pct = total ? Math.round((agg.checked / total) * 100) : 100;
+      setMsg('sn-msg',
+        '检测中 ' + agg.checked + '/' + total + '（' + pct + '%）· 可用 ' + agg.ok + ' · 额度耗尽 ' + agg.quota + ' · 限流 ' + agg.limited + ' · 未绑定 ' + agg.unbound,
+        true);
+      if (d.done) break;
+      cursor = d.nextCursor;
+    }
+    setMsg('sn-msg',
+      '检测完成：共 ' + agg.checked + ' 台 · 可用 ' + agg.ok + ' · 额度耗尽 ' + agg.quota + ' · 限流 ' + agg.limited + ' · 未绑定 ' + agg.unbound + ' · 失败 ' + agg.failed,
+      true);
+    loadAll();
+  } catch (e) {
+    setMsg('sn-msg', '检测中断：' + e.message + '（已完成 ' + agg.checked + ' 台）', false);
+  } finally {
+    checking = false;
+  }
 }
 
 async function disableUnbound() {

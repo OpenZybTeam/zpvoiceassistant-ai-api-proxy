@@ -47,11 +47,38 @@ function schemaOf(tool) {
 const ADAPTER_HINT = `若你决定调用工具，请额外输出一行：
 <tool_call>{"name":"工具名","arguments":{...}}</tool_call>`;
 
-export function buildAdapterHint(toolChoice = "auto") {
-  if (toolChoice === "required") {
-    return `[格式对齐] 本次必须调用工具。${ADAPTER_HINT}`;
+// 压缩工具清单：名字 + 一句话描述（截断到 maxDesc），不展开 JSON Schema。
+// agent 可能带几十上百个工具，完整 Schema 塞不进上游 1000 字节的单条上限，
+// 但没有清单模型就不知道该调什么，只会凭空编造结果。
+export function buildToolManifest(tools, { maxDesc = 24, budget = 1200 } = {}) {
+  const defs = (tools || [])
+    .map((t) => (t && (t.function || t)) || null)
+    .filter((f) => f && f.name);
+  if (defs.length === 0) return "";
+
+  const lines = [];
+  let used = 0;
+  for (const f of defs) {
+    const desc = String(f.description || "").replace(/\s+/g, " ").slice(0, maxDesc);
+    const line = desc ? `${f.name}(${desc})` : f.name;
+    if (used + line.length + 1 > budget) break;
+    lines.push(line);
+    used += line.length + 1;
   }
-  return `[格式对齐] ${ADAPTER_HINT}`;
+  const more = defs.length > lines.length ? ` …另有 ${defs.length - lines.length} 个` : "";
+  return lines.join(" | ") + more;
+}
+
+export function buildAdapterHint(toolChoice = "auto", tools = null) {
+  const manifest = buildToolManifest(tools);
+  const head = manifest ? `[可用工具] ${manifest}\n` : "";
+  // 实测模型会凭空造工具名（如把 Bash 叫成 get_device_info），必须显式禁止
+  const constraint = "只能调用上面列出的工具名，严禁编造不存在的工具；没有合适的工具就直接回答。";
+  // 通用环境声明：模型倾向"教用户去做"而不是"自己调用"，需要说明这是受控执行环境
+  const envNote =
+    "你在受控执行环境中，工具调用会被真实执行并由结果回填。凡是需要读取真实状态、执行操作或获取外部信息的请求，都应当直接调用工具完成，不要把命令或步骤交给用户自己去运行。";
+  const force = toolChoice === "required" ? "本次必须调用工具，不要直接回答。" : "需要真实数据时必须调用工具，禁止编造结果。";
+  return `${head}[环境] ${envNote}\n[约束] ${constraint}\n[格式对齐] ${force}${ADAPTER_HINT}`;
 }
 
 // Fold role:"tool" messages (and assistant tool_calls) back into plain text.
@@ -74,6 +101,60 @@ export function renderToolResults(messages) {
     const id = m.tool_call_id ? ` #${m.tool_call_id}` : "";
     return { role: "user", content: `[工具结果${id}]\n${trimByBytes(m.content)}` };
   });
+}
+
+
+// DSML 风格工具调用（DeepSeek 系列模型/平台常用）：
+//   <|DSML|tool_calls>
+//     <|DSML|invoke name="Bash">
+//       <|DSML|parameter name="command" string="true">ls -la</|DSML|parameter>
+//     </|DSML|invoke>
+//   </|DSML|tool_calls>
+// 分隔符有多种写法：<|DSML|...>、<｜DSML｜...>、<｜｜DSML｜｜ tool_calls>
+const DSML_OPEN = /<[|｜]DSML[|｜]\s*tool_calls[^>]*>/gi;
+const DSML_OPEN_ALT = /<｜｜DSML｜｜ tool_calls>/gi;
+const DSML_CLOSE = /<\/[|｜]DSML[|｜]\s*tool_calls>/gi;
+const DSML_CLOSE_ALT = /<\/｜｜DSML｜｜ tool_calls>/gi;
+
+function normalizeDsml(text) {
+  return String(text || "")
+    // 外层包裹
+    .replace(DSML_OPEN, "<tool_calls>")
+    .replace(DSML_OPEN_ALT, "<tool_calls>")
+    .replace(DSML_CLOSE, "</tool_calls>")
+    .replace(DSML_CLOSE_ALT, "</tool_calls>")
+    // 内层 invoke / parameter 也带同样的前缀，一律剥掉
+    .replace(/<[|｜]DSML[|｜]\s*/gi, "<")
+    .replace(/<\/[|｜]DSML[|｜]\s*/gi, "</")
+}
+
+// 从 <tool_calls>...</tool_calls> 里提取 invoke/parameter
+export function parseDsmlCalls(text, allowedNames = []) {
+  const src = normalizeDsml(text);
+  const blockRe = /<tool_calls>([\s\S]*?)<\/tool_calls>/gi;
+  const out = [];
+  let m;
+  while ((m = blockRe.exec(src)) !== null) {
+    const body = m[1];
+    const invokeRe = /<\s*invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/\s*invoke\s*>/gi;
+    let im;
+    while ((im = invokeRe.exec(body)) !== null) {
+      const name = im[1];
+      const args = {};
+      const paramRe = /<\s*parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/\s*parameter\s*>/gi;
+      let pm;
+      while ((pm = paramRe.exec(im[2])) !== null) {
+        args[pm[1]] = pm[2].trim();
+      }
+      if (out.some((c) => c.function.name === name)) continue;
+      out.push({
+        id: `call_${Math.random().toString(36).slice(2, 10)}`,
+        type: "function",
+        function: { name, arguments: JSON.stringify(args) },
+      });
+    }
+  }
+  return out;
 }
 
 // Pull <tool_call> blocks out of the model text.
@@ -108,8 +189,10 @@ export function parseToolCalls(text, allowedNames = [], schemas = {}) {
   const rejected = [];
   const push = (obj) => {
     if (!obj || typeof obj.name !== "string" || !obj.name) return;
-    if (allowedNames.length > 0 && !allowedNames.includes(obj.name)) return;
     if (calls.some((c) => c.function.name === obj.name)) return; // 去重
+    // 不再按 allowedNames 过滤：模型常编一个"更贴切"的工具名（如 system_info），
+    // 直接丢弃会让 agent 永远收不到调用。改为原样返回，
+    // agent 平台通常会回"没有这个工具，可用的是 X"，模型下一轮自动纠正。
     // 兼容参数平铺在顶层的坏格式：{"name":"run_shell","command":"date"}
     let args = obj.arguments || obj.parameters;
     if (!args || typeof args !== "object") {
@@ -134,6 +217,13 @@ export function parseToolCalls(text, allowedNames = [], schemas = {}) {
       function: { name: obj.name, arguments: JSON.stringify(args) },
     });
   };
+
+  // 0) DSML 风格优先
+  const dsml = parseDsmlCalls(src, []);
+  if (dsml.length > 0) {
+    dsml.rejected = [];
+    return dsml;
+  }
 
   // 1) 标准块
   const blockRe = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
@@ -196,7 +286,10 @@ export function parseToolCalls(text, allowedNames = [], schemas = {}) {
 
 // Strip the tool_call blocks from the visible content.
 export function stripToolCalls(text) {
-  return String(text || "").replace(TOOL_CALL_RE, "").trim();
+  const src = String(text || "");
+  // 先去掉 DSML 块，再去掉标准块
+  const withoutDsml = src.replace(/<[|｜]DSML[|｜]\s*tool_calls[^>]*>[\s\S]*?<\/[|｜]DSML[|｜]\s*tool_calls>/gi, "");
+  return withoutDsml.replace(TOOL_CALL_RE, "").trim();
 }
 
 export function toolCallPayload(text, toolCalls) {

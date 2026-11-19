@@ -25,7 +25,7 @@ import {
   putJSON,
   PREFIX,
 } from "./store.js";
-import { loginDetailed } from "./upstream.js";
+import { login, loginDetailed } from "./upstream.js";
 
 const COOLDOWN_MS = 60 * 1000;
 // 上游按天配额，命中 4001「今日次数已用完」时摘除到第二天 0 点（本地时间）。
@@ -291,7 +291,39 @@ export async function markFailure(env, sn, message = "", { dead = false, quotaEx
 }
 
 // Availability probe: try a real device login. Updates status/lastCheck.
-export async function checkCredential(env, sn) {
+// 真实可用性探测：登录（验 secret/绑定）+ 一次真实对话（验限流/额度）。
+// 只做登录测不出"今日次数已用完"和"伪成功包"，那才是真正影响可用性的两种状态。
+async function probeChat(env, rec) {
+  const { sendChatTurn } = await import("./upstream.js");
+  const token = await login(env, { sn: rec.sn, secret: rec.secret });
+  const common = {
+    token,
+    sn: rec.sn,
+    buildNum: "163",
+    buildTime: "2512151629",
+    versionName: "4.3.14",
+    versionCode: "4030014",
+    appName: "com.zuoyebang.iot.pad.zpvoiceassistant",
+    romVersion: "4.3.0",
+    local: "zh-CN",
+    __tips__: "1",
+  };
+  const res = await sendChatTurn(env, common, rec.secret, {
+    chatId: `probe-${rec.sn.slice(-8)}-${Date.now()}`,
+    content: "1+1",
+    model: "deepseek-v3",
+    role: "user",
+    kind: "8",
+  });
+  const text = await res.text();
+  if (/今日次数已用完|次数已用完/.test(text)) return { state: "quota" };
+  if (/"message"\s*:\s*"success"/.test(text) && text.includes("event: error")) return { state: "limited" };
+  if (text.includes("cid or passportId")) return { state: "unbound" };
+  if (text.includes("event: message")) return { state: "ok" };
+  return { state: "unknown", raw: text.slice(0, 200) };
+}
+
+export async function checkCredential(env, sn, { chat = true } = {}) {
   const rec = await getCredential(env, sn);
   if (!rec) return { sn, ok: false, error: "not found" };
   const started = Date.now();
@@ -309,7 +341,38 @@ export async function checkCredential(env, sn) {
     rec.cooldownUntil = 0;
     rec.okCount = (rec.okCount || 0) + 1;
     await putCredential(env, rec);
-    return { sn, ok: true, ms: Date.now() - started };
+
+    // 登录成功不代表能回答：再做一次真实对话探测限流/额度
+    if (chat && rec.binded === 1) {
+      const p = await probeChat(env, rec);
+      const now = Date.now();
+      rec.lastCheck = now;
+      if (p.state === "ok") {
+        rec.lastOkAt = now;
+        rec.failWindow = [];
+        rec.lastError = "";
+        rec.cooldownUntil = 0;
+        rec.quotaExhaustedAt = 0;
+      } else if (p.state === "quota") {
+        rec.quotaExhaustedAt = now;
+        rec.cooldownUntil = nextMidnight();
+        rec.lastError = "今日次数已用完（探测）";
+        rec.failWindow = [...(rec.failWindow || []), now];
+      } else if (p.state === "limited") {
+        rec.cooldownUntil = now + 60 * 1000;
+        rec.lastError = "限流（伪成功包）";
+        rec.failWindow = [...(rec.failWindow || []), now];
+      } else if (p.state === "unbound") {
+        rec.binded = 0;
+        rec.lastError = "未绑定账号";
+      } else {
+        rec.lastError = "对话探测异常：" + String(p.raw || "").slice(0, 80);
+      }
+      await putCredential(env, rec);
+      return { sn, ok: p.state === "ok", state: p.state, ms: Date.now() - started, binded: rec.binded };
+    }
+
+    return { sn, ok: true, ms: Date.now() - started, binded: rec.binded };
   } catch (e) {
     const msg = String(e.message || e);
     // "设备Secret获取失败" means the secret no longer matches the device.
@@ -373,11 +436,16 @@ export async function disableUnbound(env) {
   return hit;
 }
 
-export async function checkAll(env, limit = 50) {
-  const all = (await listCredentials(env)).slice(0, limit);
+// 分页检测：从 cursor 开始最多测 limit 台，返回 nextCursor（null 表示测完）。
+export async function checkAll(env, { limit = 20, cursor = 0 } = {}) {
+  const all = await listCredentials(env);
+  const total = all.length;
+  const start = Math.max(0, Number(cursor) || 0);
+  const slice = all.slice(start, start + limit);
   const results = [];
-  for (const rec of all) {
+  for (const rec of slice) {
     results.push(await checkCredential(env, rec.sn));
   }
-  return results;
+  const next = start + slice.length;
+  return { results, total, done: next >= total, nextCursor: next >= total ? null : next };
 }

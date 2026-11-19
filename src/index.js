@@ -82,6 +82,18 @@ async function looksQuotaExhausted(response) {
 }
 
 // 统一的错误日志钩子（P2-9：不再静默吞错）
+// 响应返回后运行时可能立即终止 isolate，fire-and-forget 的 KV 写会被砍掉。
+// ctx.waitUntil() 能把这类后台任务挂住，保证写完。
+function background(ctx, promise, label = "bg") {
+  const p = Promise.resolve(promise).catch(logErr(label));
+  try {
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  } catch (err) {
+    console.warn("[background] waitUntil failed: " + (err && err.message ? err.message : err));
+  }
+  return p;
+}
+
 function logErr(where) {
   return (err) => {
     try {
@@ -93,9 +105,18 @@ function logErr(where) {
 }
 
 // 指数退避：命中限流类失败后先在同一台设备上等待重试，避免"连打三台全被限"。
-const BACKOFF_BASE_MS = 1500;
-const BACKOFF_MAX_RETRIES = 3; // 每台设备最多原地重试次数
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 流式首事件探测失败（429 + device_retryable）：说明这台设备在限流，换一台。
+async function looksDeviceRetryable(response) {
+  if (response.status !== 429) return false;
+  try {
+    const data = await response.clone().json();
+    return !!(data && data.error && data.error.device_retryable);
+  } catch {
+    return false;
+  }
+}
 
 // 上游"伪成功"已经在 openai.js 里转成 502 + code=upstream_opaque_success，
 // 这里只要看 code 就能判断要不要换设备重试。
@@ -118,7 +139,7 @@ function errorBody(message, type = "invalid_request_error", code = null) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
 
@@ -244,13 +265,19 @@ export default {
 
     if (pathname === "/v1/chat/completions") {
       if (request.method !== "POST") {
+        const mRun = startRun({ route: "chat-method" });
+        mRun.meta.path = pathname;
+        mRun.meta.method = request.method;
+        const mRec = mRun.finish("error", "method_not_allowed", {});
+        background(ctx, commitRun(env, mRec), "commitRun-405");
         return json(errorBody("Method not allowed", "invalid_request_error"), 405, request);
       }
       const run = startRun({ route: "chat" });
+      let streamCommitted = false;
       const finish = (record, response) => {
         // 关键 1：日志写 KV 不能阻塞返回。流式响应的 body 还在后台异步写入，
         // 这里 await 会让 client 迟迟拿不到流（背压卡死 → 0 字节）。
-        commitRun(env, record).catch(() => {});
+        background(ctx, commitRun(env, record), "commitRun");
         // 关键 2：不能用 new Response(response.body, ...) 重新包装，直接改原对象 headers。
         if (response && response.headers) {
           try {
@@ -287,6 +314,22 @@ export default {
       }
 
       run.step("body", { bytes: rawBody.length, model: parsedBody && parsedBody.model });
+      // 记录请求体摘要：消息条数、各角色、是否有 tools/stream、首条消息预览
+      try {
+        const msgs = Array.isArray(parsedBody && parsedBody.messages) ? parsedBody.messages : [];
+        run.meta.req = {
+          stream: !!(parsedBody && parsedBody.stream),
+          msgs: msgs.length,
+          roles: msgs.map((m) => m && m.role).join(","),
+          tools: Array.isArray(parsedBody && parsedBody.tools) ? parsedBody.tools.length : 0,
+          toolChoice: (parsedBody && parsedBody.tool_choice) || null,
+          bodyBytes: rawBody.length,
+          firstMsg: msgs[0] ? String(typeof msgs[0].content === "string" ? msgs[0].content : JSON.stringify(msgs[0].content)).slice(0, 80) : "",
+          lastMsg: msgs.length ? String(typeof msgs[msgs.length - 1].content === "string" ? msgs[msgs.length - 1].content : JSON.stringify(msgs[msgs.length - 1].content)).slice(0, 80) : "",
+        };
+      } catch {
+        // 摘要失败不影响主流程
+      }
 
       // 用会话种子算出/取出该会话绑定的设备
       const seed = conversationSeed(parsedBody);
@@ -294,25 +337,45 @@ export default {
       const bound = await boundDevice(env, seed);
       run.step("bind", { bound: bound || "none" });
       run.meta.model = (parsedBody && parsedBody.model) || "";
-      run.meta.token = gate.record.prefix;
       run.meta.seed = seed ? seed.slice(0, 24) : "";
+      run.meta.token = gate.record.prefix;
 
       let response = null;
       let usedSn = "";
       let avoidSn = "";
       let quotaHit = 0;
+      let lastFailureDetail = "";
       let inPlaceRetries = 0;
       for (let attempt = 0; attempt < RETRY_DEVICES; attempt++) {
-        // 剩余预算不够一次上游调用时，停止重试，直接给出已有失败原因
-        if (Date.now() - run.start > REQUEST_DEADLINE_MS - 8000) {
-          run.retry({ reason: "deadline", elapsed: Date.now() - run.start });
+        // 每次重试前都检查剩余预算：不够一次上游调用就直接收尾，
+        // 别让调用方等 90 秒还拿不到东西。
+        const elapsed = Date.now() - run.start;
+        if (elapsed > REQUEST_DEADLINE_MS - 8000) {
+          run.retry({ reason: "deadline", elapsed });
           break;
         }
         let cred;
         try {
           cred = await pick(env, { preferSn: attempt === 0 ? bound : "", avoidSn });
         } catch (e) {
-          return json(errorBody(`Credential pool: ${e.message}`, "api_error", "pool_empty"), 503, request);
+          // 池子暂时没有可用设备：对调用方是"稍后重试"，不是"请求错误"
+          const resp = json(
+            {
+              error: {
+                message: `Credential pool unavailable: ${e.message}`,
+                type: "rate_limit_error",
+                param: null,
+                code: "pool_empty",
+                retryable: true,
+                retry_after: 60,
+              },
+            },
+            429,
+            request
+          );
+          resp.headers.set("Retry-After", "60");
+          const rec = run.finish("error", "pool_empty");
+          return finish(rec, resp);
         }
         usedSn = cred.sn;
         run.step("pick", { sn: usedSn, attempt: attempt + 1 });
@@ -330,7 +393,38 @@ export default {
           // 单次上游调用加超时：卡死时立刻失败，而不是让 agent 干等
           const remain = Math.max(5000, REQUEST_DEADLINE_MS - (Date.now() - run.start));
           response = await withTimeout(
-            handleChatCompletions(replay, env, cred, "pool", { token: gate.record, boundSn: bound, requestId: run.id }),
+            handleChatCompletions(replay, env, cred, "pool", {
+              token: gate.record,
+              boundSn: bound,
+              requestId: run.id,
+              // 切片路径会用这两个做设备级重试与总预算控制
+              pickDevice: async (tried) => {
+                try {
+                  return await pick(env, { avoidSn: (tried || []).slice(-1)[0] || "" });
+                } catch {
+                  return null;
+                }
+              },
+              deadlineMs: Math.max(8000, REQUEST_DEADLINE_MS - (Date.now() - run.start) - 5000),
+              startedAt: run.start,
+              // 流结束时才提交日志（此时切片打点已全部记录）
+              // 流结束时才提交：此时切片打点（batch-ms / chunk-ms）都已在 run.steps 里
+              onStreamDone: async () => {
+                if (streamCommitted) return;
+                streamCommitted = true;
+                const rec2 = run.finish("ok", null, { sn: usedSn, streaming: true });
+                // 必须 await：isolate 可能在响应结束后被回收，fire-and-forget 会丢
+                await commitRun(env, rec2);
+              },
+              onChunkEvent: (type, payload) => {
+                if (type === "chunk-ms") run.step("chunk" + (payload.index + 1), { ms: payload.ms });
+                else if (type === "retry") run.retry({ reason: "chunk-retry", ...payload });
+                else if (type === "deadline") run.step("chunk-deadline", { elapsed: payload.elapsed });
+                else if (type === "plan") run.step("chunk-plan", { chunks: payload.chunks });
+                else if (type === "batch-ms") run.step("batch" + (payload.from + 1) + "-" + payload.count, { ms: payload.ms });
+                else if (type === "chunk-failed") run.step("chunk-fail" + (payload.index + 1), { msg: payload.message });
+              },
+            }),
             Math.min(remain, 45000),
             "upstream"
           );
@@ -340,16 +434,25 @@ export default {
           const rec = run.finish("error", err.message, { sn: usedSn });
           return finish(rec, json(errorBody(`Upstream error: ${err.message}`, "api_error", err.code || null), 502, request));
         }
-        // 流式响应必须直接接受：任何 clone/text() 检查都会把 body 读空，
-        // 客户端会收到 200 + text/event-stream + 0 字节。
+        // 流式响应：streamResponse 内部已做首事件探测。
+        // 若首事件是 error（伪成功/限流），会返回 429 + device_retryable，
+        // 此时可以安全换设备重试；否则直接接受（绝不能再 clone，否则读空 body）。
         const respType = (response.headers.get("content-type") || "").toLowerCase();
         if (respType.includes("text/event-stream")) {
           break;
+        }
+        // 流式探测失败的 429：换设备重试
+        if (response.status === 429 && (await looksDeviceRetryable(response))) {
+          lastFailureDetail = "stream first-event error on " + usedSn.slice(-6);
+          avoidSn = usedSn;
+          response = null;
+          continue;
         }
 
         // ① 配额耗尽：这是"这台设备今天用完了"，必须换设备——哪怕会话已绑定，
         //    因为留着它只会继续报错。换到的新设备会覆盖绑定。
         if (await looksQuotaExhausted(response)) {
+          lastFailureDetail = "quota exhausted (4001) on " + usedSn.slice(-6);
           await markFailure(env, usedSn, "今日次数已用完", { quotaExhausted: true });
           quotaHit++;
           avoidSn = usedSn;
@@ -358,14 +461,16 @@ export default {
         }
         // ② 不透明失败：先原地退避重试（限流多为瞬时），多次失败再换设备。
         if (!(await looksRetryable(response))) break;
-        if (inPlaceRetries < BACKOFF_MAX_RETRIES) {
+        // 限流（伪成功）不占用外层"换设备"名额：原地最多再试 1 次就换设备
+        if (inPlaceRetries < 1 && Date.now() - run.start < REQUEST_DEADLINE_MS - 10000) {
           inPlaceRetries++;
           run.retry({ reason: "opaque", sn: usedSn, n: inPlaceRetries });
-          await sleep(BACKOFF_BASE_MS * 2 ** (inPlaceRetries - 1));
+          await sleep(1000);
           attempt--; // 原地重试不消耗换设备次数
           response = null;
           continue;
         }
+        lastFailureDetail = "opaque success payload on " + usedSn.slice(-6);
         await markFailure(env, usedSn, "upstream opaque failure", { dead: false });
         avoidSn = usedSn;
         inPlaceRetries = 0;
@@ -373,18 +478,28 @@ export default {
       }
       if (!response) {
         const anyQuota = quotaHit > 0;
-        const rec = run.finish("error", anyQuota ? "quota_exhausted" : "pool_exhausted", { sn: usedSn });
-        return finish(rec, json(
-          errorBody(
-            anyQuota
-              ? `All pool devices exhausted their daily quota (${quotaHit} checked). Add more devices in /admin or retry after midnight.`
-              : "All pool devices returned the opaque upstream failure",
-            "api_error",
-            anyQuota ? "quota_exhausted" : "pool_exhausted"
-          ),
-          502,
+        const code = anyQuota ? "quota_exhausted" : "pool_exhausted";
+        const retryAfter = anyQuota ? 3600 : 30;
+        const detail = lastFailureDetail ? " Last upstream reply: " + lastFailureDetail : "";
+        const rec = run.finish("error", code, { sn: usedSn, detail: lastFailureDetail });
+        const resp = json(
+          {
+            error: {
+              message: (anyQuota
+                ? "All pool devices exhausted their daily quota (" + quotaHit + " checked)."
+                : "All pool devices returned an opaque upstream failure.") + detail,
+              type: "rate_limit_error",
+              param: null,
+              code: code,
+              retryable: true,
+              retry_after: retryAfter,
+            },
+          },
+          429,
           request
-        ));
+        );
+        resp.headers.set("Retry-After", String(retryAfter));
+        return finish(rec, resp);
       }
 
       // 记录会话 -> 设备绑定，后续同一会话不再轮换。
@@ -400,19 +515,32 @@ export default {
         prompt_tokens: Number(response.headers.get("x-iot-prompt-tokens") || 0),
         completion_tokens: Number(response.headers.get("x-iot-completion-tokens") || 0),
       };
-      Promise.all([
-        markSuccess(env, usedSn).catch(logErr("markSuccess")),
-        consumeToken(env, gate.record).catch(logErr("consumeToken")),
-        recordRequestUsage(env, usedSn, gate.record.hash, delta).catch(logErr("usage")),
-      ]).catch(() => {});
+      background(ctx, markSuccess(env, usedSn), "markSuccess");
+      background(ctx, consumeToken(env, gate.record), "consumeToken");
+      background(ctx, recordRequestUsage(env, usedSn, gate.record.hash, delta), "usage");
       // 流式响应在返回 Response 时 body 还在持续写入，这里标注一下，
       // 免得把"响应头返回"误读成"全部内容已发出"。
+      // 流式响应也必须写日志：之前直接 return 导致超长请求（切片流式）
+      // 和普通流式请求在后台日志里完全找不到。
       const isStream = (response.headers.get("content-type") || "").includes("text/event-stream");
-      if (isStream) return response;
-      const rec = run.finish("ok", null, { sn: usedSn, streaming: isStream });
+      if (isStream) {
+        // 流式：打点在流进行中持续发生，等 onStreamDone 回调时再固化日志
+        return response;
+      }
+      const rec = run.finish("ok", null, { sn: usedSn, streaming: false });
       return finish(rec, response);
     }
 
+    // 未知路由：记录下来，否则"请求根本没到"和"路径拼错了"无法区分
+    {
+      const missRun = startRun({ route: "miss" });
+      missRun.meta.path = pathname;
+      missRun.meta.method = request.method;
+      missRun.meta.query = url.search || "";
+      missRun.meta.ua = (request.headers.get("user-agent") || "").slice(0, 80);
+      const rec = missRun.finish("error", "not_found", {});
+      background(ctx, commitRun(env, rec), "commitRun-404");
+    }
     return json(errorBody(`Unknown route: ${pathname}`, "invalid_request_error", "not_found"), 404, request);
   },
 };

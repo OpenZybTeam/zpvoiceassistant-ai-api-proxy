@@ -374,8 +374,26 @@ export async function handleAdmin(request, env) {
   if (path === "/admin/api/sns/check" && method === "POST") {
     const body = await readJson(request) || {};
     if (body.all) {
-      const results = await checkAll(env);
-      return json({ ok: true, results });
+      // 分页：默认每批 15 台，客户端带 cursor 逐批取，直到 done
+      const limit = Math.min(Math.max(Number(body.limit) || 15, 1), 50);
+      const cursor = Number(body.cursor) || 0;
+      const r = await checkAll(env, { limit, cursor });
+      const count = (st) => r.results.filter((x) => x.state === st).length;
+      return json({
+        ok: true,
+        results: r.results,
+        total: r.total,
+        done: r.done,
+        nextCursor: r.nextCursor,
+        summary: {
+          checked: r.results.length,
+          ok: count("ok"),
+          quota: count("quota"),
+          limited: count("limited"),
+          unbound: count("unbound"),
+          failed: r.results.filter((x) => !x.ok && !x.state).length,
+        },
+      });
     }
     if (!body.sn) return json({ error: "sn_required" }, 400);
     const r = await checkCredential(env, String(body.sn));
